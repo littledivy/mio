@@ -52,6 +52,11 @@ macro_rules! kevent {
     };
 }
 
+use mach2::port::*;
+use mach2::mach_port::*;
+use mach2::message::*;
+use mach2::traps::mach_task_self;
+
 #[derive(Debug)]
 pub struct Selector {
     #[cfg(debug_assertions)]
@@ -59,18 +64,26 @@ pub struct Selector {
     kq: RawFd,
     #[cfg(debug_assertions)]
     has_waker: AtomicBool,
+    k_port: mach_port_t,
 }
 
 impl Selector {
     pub fn new() -> io::Result<Selector> {
         syscall!(kqueue())
             .and_then(|kq| syscall!(fcntl(kq, libc::F_SETFD, libc::FD_CLOEXEC)).map(|_| kq))
-            .map(|kq| Selector {
+            .map(|kq| {
+                let mut k_port = 0;
+                unsafe {
+                    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &mut k_port);
+                };
+                Selector {
                 #[cfg(debug_assertions)]
                 id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 kq,
                 #[cfg(debug_assertions)]
                 has_waker: AtomicBool::new(false),
+                k_port,
+                }
             })
     }
 
@@ -82,6 +95,7 @@ impl Selector {
             kq,
             #[cfg(debug_assertions)]
             has_waker: AtomicBool::new(self.has_waker.load(Ordering::Acquire)),
+            k_port: self.k_port,
         })
     }
 
@@ -122,11 +136,11 @@ impl Selector {
             [MaybeUninit::uninit(), MaybeUninit::uninit()];
         let mut n_changes = 0;
 
-        if interests.is_writable() {
-            let kevent = kevent!(fd, libc::EVFILT_WRITE, flags, token.0);
-            changes[n_changes] = MaybeUninit::new(kevent);
-            n_changes += 1;
-        }
+        // if interests.is_writable() {
+        //     let kevent = kevent!(fd, libc::EVFILT_WRITE, flags, token.0);
+        //     changes[n_changes] = MaybeUninit::new(kevent);
+        //     n_changes += 1;
+        // }
 
         if interests.is_readable() {
             let kevent = kevent!(fd, libc::EVFILT_READ, flags, token.0);
@@ -210,15 +224,9 @@ impl Selector {
     // Used by `Waker`.
     #[cfg(any(target_os = "freebsd", target_os = "ios", target_os = "macos"))]
     pub fn setup_waker(&self, token: Token) -> io::Result<()> {
-        // First attempt to accept user space notifications.
-        let mut kevent = kevent!(
-            0,
-            libc::EVFILT_USER,
-            libc::EV_ADD | libc::EV_CLEAR | libc::EV_RECEIPT,
-            token.0
-        );
-
-        syscall!(kevent(self.kq, &kevent, 1, &mut kevent, 1, ptr::null())).and_then(|_| {
+        let mut kevent = kevent!(self.k_port, libc::EVFILT_MACHPORT, libc::EV_ADD | libc::EV_ENABLE, token.0);
+        kevent.fflags = (MACH_RCV_MSG | MACH_RCV_OVERWRITE) as libc::uint32_t;
+        syscall!(kevent(self.kq, &kevent, 1, &mut kevent, 0, ptr::null())).and_then(|_| {
             if (kevent.flags & libc::EV_ERROR) != 0 && kevent.data != 0 {
                 Err(io::Error::from_raw_os_error(kevent.data as i32))
             } else {
@@ -230,21 +238,18 @@ impl Selector {
     // Used by `Waker`.
     #[cfg(any(target_os = "freebsd", target_os = "ios", target_os = "macos"))]
     pub fn wake(&self, token: Token) -> io::Result<()> {
-        let mut kevent = kevent!(
-            0,
-            libc::EVFILT_USER,
-            libc::EV_ADD | libc::EV_RECEIPT,
-            token.0
-        );
-        kevent.fflags = libc::NOTE_TRIGGER;
+        let mut head = mach_msg_header_t {
+            msgh_bits: MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0),
+            msgh_size: mem::size_of::<mach_msg_header_t>() as mach_msg_size_t,
+            msgh_remote_port: self.k_port,
+            ..unsafe { mem::zeroed() }
+        };
 
-        syscall!(kevent(self.kq, &kevent, 1, &mut kevent, 1, ptr::null())).and_then(|_| {
-            if (kevent.flags & libc::EV_ERROR) != 0 && kevent.data != 0 {
-                Err(io::Error::from_raw_os_error(kevent.data as i32))
-            } else {
-                Ok(())
-            }
-        })
+        // mach_msg_send
+        unsafe { mach_msg_send(
+            &mut head as *mut _
+        ) };
+        Ok(())
     }
 }
 
