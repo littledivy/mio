@@ -136,11 +136,11 @@ impl Selector {
             [MaybeUninit::uninit(), MaybeUninit::uninit()];
         let mut n_changes = 0;
 
-        // if interests.is_writable() {
-        //     let kevent = kevent!(fd, libc::EVFILT_WRITE, flags, token.0);
-        //     changes[n_changes] = MaybeUninit::new(kevent);
-        //     n_changes += 1;
-        // }
+        if interests.is_writable() {
+            let kevent = kevent!(fd, libc::EVFILT_WRITE, flags, token.0);
+            changes[n_changes] = MaybeUninit::new(kevent);
+            n_changes += 1;
+        }
 
         if interests.is_readable() {
             let kevent = kevent!(fd, libc::EVFILT_READ, flags, token.0);
@@ -225,7 +225,7 @@ impl Selector {
     #[cfg(any(target_os = "freebsd", target_os = "ios", target_os = "macos"))]
     pub fn setup_waker(&self, token: Token) -> io::Result<()> {
         let mut kevent = kevent!(self.k_port, libc::EVFILT_MACHPORT, libc::EV_ADD | libc::EV_ENABLE, token.0);
-        kevent.fflags = (MACH_RCV_MSG | MACH_RCV_OVERWRITE) as libc::uint32_t;
+
         syscall!(kevent(self.kq, &kevent, 1, &mut kevent, 0, ptr::null())).and_then(|_| {
             if (kevent.flags & libc::EV_ERROR) != 0 && kevent.data != 0 {
                 Err(io::Error::from_raw_os_error(kevent.data as i32))
@@ -237,19 +237,24 @@ impl Selector {
 
     // Used by `Waker`.
     #[cfg(any(target_os = "freebsd", target_os = "ios", target_os = "macos"))]
-    pub fn wake(&self, token: Token) -> io::Result<()> {
+    pub fn wake(&self, _: Token) -> io::Result<()> {
         let mut head = mach_msg_header_t {
-            msgh_bits: MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0),
+            msgh_bits: MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND_ONCE, 0),
             msgh_size: mem::size_of::<mach_msg_header_t>() as mach_msg_size_t,
             msgh_remote_port: self.k_port,
+            msgh_local_port: MACH_PORT_NULL,
             ..unsafe { mem::zeroed() }
         };
 
-        // mach_msg_send
-        unsafe { mach_msg_send(
-            &mut head as *mut _
-        ) };
-        Ok(())
+        let ret = unsafe { 
+            mach_msg_send(&mut head as *mut _)
+        };
+        if ret != libc::KERN_SUCCESS {
+            unsafe { mach_msg_destroy(&mut head as *mut _) };
+            Err(io::Error::from_raw_os_error(ret))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -313,6 +318,8 @@ impl AsRawFd for Selector {
 
 impl Drop for Selector {
     fn drop(&mut self) {
+        unsafe { mach_port_deallocate(mach_task_self(), self.k_port) };
+
         if let Err(err) = syscall!(close(self.kq)) {
             error!("error closing kqueue: {}", err);
         }
@@ -369,7 +376,7 @@ pub mod event {
             // pipe it will emit a readable event so we'll fake that here as
             // well.
             {
-                event.filter == libc::EVFILT_USER
+                event.filter == libc::EVFILT_MACHPORT
             }
             #[cfg(not(any(target_os = "freebsd", target_os = "ios", target_os = "macos")))]
             {
